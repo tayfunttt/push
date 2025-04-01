@@ -1,56 +1,105 @@
 ﻿const express = require("express");
-const webpush = require("web-push");
-const bodyParser = require("body-parser");
+const http = require("http");
+const socketIo = require("socket.io");
 const cors = require("cors");
+const fs = require("fs");
+const webPush = require("web-push");
 
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
-app.use(express.static(__dirname));
 
-const abonelikler = {};
+// CORS ayarı (frontend alan adını burada belirt)
+app.use(cors({
+  origin: "https://parpar.it",
+  methods: ["GET", "POST"]
+}));
 
-webpush.setVapidDetails(
-  "mailto:sen@example.com",
-  "BBmkso1ixwQ8On7uqdmz8wNuwHloZMhwoRRWcQKNGvyijIlsbEwZf1-SVl0BqbBvhbRqFUz5_f31eSTHCmAj2ic",
-  "L93WoCAlXlFyLVk56LhB1PruElgLlxJ7XJN1EENXhng"
+app.use(express.json());
+app.use(express.static("public"));
+
+const server = http.createServer(app);
+
+// Socket.IO CORS ayarı
+const io = socketIo(server, {
+  cors: {
+    origin: "https://parpar.it",
+    methods: ["GET", "POST"]
+  }
+});
+
+// VAPID bilgileri — kendine ait olanları buraya koy
+webPush.setVapidDetails(
+  "mailto:you@example.com",
+  "BMYLktPLerCw_7_1ucqHoTjuoRq-JNWwRDb0kyRE3A_NqXSk6sssDjCLPJsTaJkfXVZMC2Lvrn_SNGNsgoFfe_Q",
+  "yS0l3kmTelAEEKIiycpWhi8hgxwFGPKOdfdQ85tEGFU"
 );
 
-app.post("/kayit", (req, res) => {
-  const { oda, id, subscription } = req.body;
-  const odaKey = `oda_${oda}`;
-  abonelikler[odaKey] ||= {};
-  abonelikler[odaKey][id] = subscription;
-  res.sendStatus(200);
+let subscriptions = {};
+let onlineUsers = {};
+
+app.post("/subscribe", (req, res) => {
+  const { userId, subscription } = req.body;
+  subscriptions[userId] = subscription;
+  fs.writeFileSync("subscriptions.json", JSON.stringify(subscriptions, null, 2));
+  res.status(201).json({ message: "Subscription saved." });
 });
 
-app.get("/kullanicilar", (req, res) => {
-  const odaKey = `oda_${req.query.oda}`;
-  const kullanicilar = Object.keys(abonelikler[odaKey] || {});
-  res.json(kullanicilar);
+io.on("connection", (socket) => {
+  console.log("Yeni bağlantı:", socket.id);
+
+  socket.on("register", (userId) => {
+    onlineUsers[userId] = socket.id;
+    console.log(`${userId} bağlandı`);
+  });
+
+  socket.on("sendMessage", ({ from, to, message }) => {
+    const msgData = { from, message, timestamp: Date.now() };
+
+    if (onlineUsers[to]) {
+      io.to(onlineUsers[to]).emit("receiveMessage", msgData);
+    } else {
+      const filePath = `./log-${to}.json`;
+      let log = [];
+
+      if (fs.existsSync(filePath)) {
+        log = JSON.parse(fs.readFileSync(filePath));
+      }
+
+      log.push(msgData);
+      fs.writeFileSync(filePath, JSON.stringify(log, null, 2));
+
+      if (subscriptions[to]) {
+        const payload = JSON.stringify({
+          title: "Yeni mesaj!",
+          body: `${from} seni arıyor.`
+        });
+
+        webPush.sendNotification(subscriptions[to], payload).catch(err => {
+          console.error("Push gönderilemedi:", err);
+        });
+      }
+    }
+  });
+
+  socket.on("getOfflineMessages", (userId) => {
+    const filePath = `./log-${userId}.json`;
+    if (fs.existsSync(filePath)) {
+      const messages = JSON.parse(fs.readFileSync(filePath));
+      socket.emit("offlineMessages", messages);
+      fs.unlinkSync(filePath);
+    }
+  });
+
+  socket.on("disconnect", () => {
+    for (const [userId, id] of Object.entries(onlineUsers)) {
+      if (id === socket.id) {
+        delete onlineUsers[userId];
+        console.log(`${userId} bağlantısı kesildi`);
+        break;
+      }
+    }
+  });
 });
 
-app.post("/gonder", async (req, res) => {
-  const { oda, hedefID, mesaj } = req.body;
-  const odaKey = `oda_${oda}`;
-  const sub = abonelikler[odaKey]?.[hedefID];
-
-  if (!sub) {
-    console.log("❗ Kullanıcıya ait abonelik bulunamadı:", hedefID);
-    return res.sendStatus(404);
-  }
-
-  const payload = JSON.stringify({ title: "Yeni Mesaj", body: mesaj });
-
-  try {
-    console.log("📤 Push gönderiliyor:", sub.endpoint);
-    await webpush.sendNotification(sub, payload);
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("❌ Push gönderme hatası:", err);
-    res.sendStatus(500);
-  }
-});
-app.listen(3000, () => {
-  console.log("📡 Push chat server çalışıyor: http://localhost:3000");
+server.listen(3000, () => {
+  console.log("Server 3000 portunda çalışıyor");
 });
